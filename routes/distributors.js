@@ -1,22 +1,24 @@
 import express from 'express';
-import User from '../models/User.js';
+import User from '../models/UserUpdated.js';
 import Permission from '../models/Permission.js';
 import Role from '../models/Role.js';
+import { requireAuth, requireAdmin } from '../middleware/auth.js';
 
 const router = express.Router();
 
-// Default permissions for new distributors
+// Default permissions for new distributors based on the image requirements
 const getDefaultDistributorPermissions = async () => {
   const defaultPermissionNames = [
-    // Clients, Files, Orders: View Own + Create + Update + Delete
+    // الشركات: عرض الخاصة + عرض الكل
+    'suppliers.view_own', 'suppliers.view_all',
+    // العملاء: عرض الخاصة + إنشاء + تعديل + حذف
     'clients.view_own', 'clients.create', 'clients.update', 'clients.delete',
-    'files.view_own', 'files.create', 'files.update', 'files.delete',
+    // الملفات: عرض الخاصة + عرض الكل + إنشاء + تعديل + حذف
+    'files.view_own', 'files.view_all', 'files.create', 'files.update', 'files.delete',
+    // الطلبات: عرض الخاصة + إنشاء + تعديل + حذف
     'orders.view_own', 'orders.create', 'orders.update', 'orders.delete',
-    // Suppliers, Agents: View Own only
-    'suppliers.view_own',
-    'agents.view_own',
-    // Reports: View Own
-    'reports.view_own'
+    // الوُسطاء: عرض الخاصة
+    'agents.view_own'
   ];
   
   const permissions = await Permission.find({ name: { $in: defaultPermissionNames } });
@@ -24,10 +26,15 @@ const getDefaultDistributorPermissions = async () => {
 };
 
 // List distributors
-router.get('/', async (req, res) => {
+router.get('/', requireAuth, requireAdmin, async (req, res) => {
   try {
     const distributors = await User.find({ role: 'distributor' })
-      .populate('roles')
+      .populate({
+        path: 'roles',
+        populate: {
+          path: 'permissions'
+        }
+      })
       .sort({ createdAt: -1 });
     res.render('distributors/index', { distributors });
   } catch (error) {
@@ -37,9 +44,12 @@ router.get('/', async (req, res) => {
 });
 
 // New distributor form
-router.get('/new', async (req, res) => {
+router.get('/new', requireAuth, requireAdmin, async (req, res) => {
   try {
-    const permissions = await Permission.find({ isActive: true }).sort({ module: 1, action: 1 });
+    const permissions = await Permission.find({ 
+      isActive: true,
+      module: { $in: ['suppliers', 'clients', 'files', 'orders', 'agents'] }
+    }).sort({ module: 1, action: 1 });
     
     // Group permissions by module
     const groupedPermissions = permissions.reduce((acc, permission) => {
@@ -64,42 +74,59 @@ router.get('/new', async (req, res) => {
 });
 
 // Create distributor
-router.post('/', async (req, res) => {
+router.post('/', requireAuth, requireAdmin, async (req, res) => {
   try {
     const { username, password, commissionRate, permissions } = req.body;
     
+    // Create the distributor user
     const distributor = new User({
       username,
       password,
       role: 'distributor',
       commissionRate: parseFloat(commissionRate) || 0,
+      // Keep legacy permissions for backward compatibility
       permissions: {
-        canCreateCompanies: permissions?.canCreateCompanies === 'on',
-        canCreateInvoices: permissions?.canCreateInvoices === 'on',
-        canManageClients: permissions?.canManageClients === 'on',
-        canViewReports: permissions?.canViewReports === 'on'
+        canCreateCompanies: false,
+        canCreateInvoices: true,
+        canManageClients: true,
+        canViewReports: true
       }
     });
     
     await distributor.save();
     
-    // Assign distributor role
-    const distributorRole = await Role.findOne({ name: 'distributor' });
-    if (distributorRole) {
-      distributor.roles = [distributorRole._id];
-      await distributor.save();
+    // Create or get distributor role
+    let distributorRole = await Role.findOne({ name: 'distributor' });
+    if (!distributorRole) {
+      distributorRole = new Role({
+        name: 'distributor',
+        displayName: 'موزع',
+        description: 'صلاحيات أساسية للموزعين',
+        isSystemRole: true,
+        permissions: Array.isArray(permissions) ? permissions : [permissions].filter(Boolean)
+      });
+      await distributorRole.save();
+    } else {
+      // Update role permissions with selected permissions
+      distributorRole.permissions = Array.isArray(permissions) ? permissions : [permissions].filter(Boolean);
+      await distributorRole.save();
     }
     
-    req.flash('success', 'تم إضافة الموزع بنجاح');
+    // Assign role to distributor
+    distributor.roles = [distributorRole._id];
+    await distributor.save();
+    
+    req.flash('success', 'تم إضافة الموزع بنجاح مع الصلاحيات المحددة');
     res.redirect('/distributors');
   } catch (error) {
+    console.error('Error creating distributor:', error);
     req.flash('error', 'حدث خطأ أثناء إضافة الموزع');
     res.redirect('/distributors/new');
   }
 });
 
 // Edit distributor form
-router.get('/:id/edit', async (req, res) => {
+router.get('/:id/edit', requireAuth, requireAdmin, async (req, res) => {
   try {
     const distributor = await User.findById(req.params.id)
       .populate({
@@ -114,7 +141,10 @@ router.get('/:id/edit', async (req, res) => {
       return res.redirect('/distributors');
     }
     
-    const permissions = await Permission.find({ isActive: true }).sort({ module: 1, action: 1 });
+    const permissions = await Permission.find({ 
+      isActive: true,
+      module: { $in: ['suppliers', 'clients', 'files', 'orders', 'agents'] }
+    }).sort({ module: 1, action: 1 });
     
     // Group permissions by module
     const groupedPermissions = permissions.reduce((acc, permission) => {
@@ -145,27 +175,77 @@ router.get('/:id/edit', async (req, res) => {
 });
 
 // Update distributor
-router.put('/:id', async (req, res) => {
+router.put('/:id', requireAuth, requireAdmin, async (req, res) => {
   try {
     const { username, commissionRate, permissions, isActive } = req.body;
     
+    const distributor = await User.findById(req.params.id).populate('roles');
+    if (!distributor) {
+      req.flash('error', 'الموزع غير موجود');
+      return res.redirect('/distributors');
+    }
+    
+    // Update basic distributor info
     const updateData = {
       username,
       commissionRate: parseFloat(commissionRate) || 0,
-      permissions: {
-        canCreateCompanies: permissions?.canCreateCompanies === 'on',
-        canCreateInvoices: permissions?.canCreateInvoices === 'on',
-        canManageClients: permissions?.canManageClients === 'on',
-        canViewReports: permissions?.canViewReports === 'on'
-      },
       isActive: isActive === 'on'
     };
     
     await User.findByIdAndUpdate(req.params.id, updateData);
-    req.flash('success', 'تم تحديث بيانات الموزع بنجاح');
+    
+    // Update role permissions
+    if (distributor.roles && distributor.roles.length > 0) {
+      const role = distributor.roles[0];
+      role.permissions = Array.isArray(permissions) ? permissions : [permissions].filter(Boolean);
+      await role.save();
+    } else {
+      // Create new role if none exists
+      const newRole = new Role({
+        name: `distributor_${distributor.username}`,
+        displayName: `صلاحيات ${distributor.username}`,
+        description: 'صلاحيات مخصصة للموزع',
+        permissions: Array.isArray(permissions) ? permissions : [permissions].filter(Boolean)
+      });
+      await newRole.save();
+      
+      distributor.roles = [newRole._id];
+      await distributor.save();
+    }
+    
+    req.flash('success', 'تم تحديث بيانات الموزع والصلاحيات بنجاح');
     res.redirect('/distributors');
   } catch (error) {
+    console.error('Error updating distributor:', error);
     req.flash('error', 'حدث خطأ أثناء تحديث بيانات الموزع');
+    res.redirect('/distributors');
+  }
+});
+
+// Delete distributor
+router.delete('/:id', requireAuth, requireAdmin, async (req, res) => {
+  try {
+    const distributor = await User.findById(req.params.id);
+    if (!distributor) {
+      req.flash('error', 'الموزع غير موجود');
+      return res.redirect('/distributors');
+    }
+    
+    // Delete associated custom roles (not system roles)
+    if (distributor.roles) {
+      for (const roleId of distributor.roles) {
+        const role = await Role.findById(roleId);
+        if (role && !role.isSystemRole) {
+          await Role.findByIdAndDelete(roleId);
+        }
+      }
+    }
+    
+    await User.findByIdAndDelete(req.params.id);
+    req.flash('success', 'تم حذف الموزع بنجاح');
+    res.redirect('/distributors');
+  } catch (error) {
+    req.flash('error', 'حدث خطأ أثناء حذف الموزع');
     res.redirect('/distributors');
   }
 });
